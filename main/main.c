@@ -13,13 +13,22 @@ typedef enum {
     STATE_RUNNING = 1,
 } system_state_t;
 
-static system_state_t system_state = STATE_STOPPED;
+typedef struct {
+    uint32_t elapsed_s;
+    float distance_cm;
+    bool is_error;
+} reading_t;
+
+static volatile system_state_t system_state = STATE_STOPPED;
 static uint32_t period_ms = 3000;
-static uint64_t echo_start_us = 0;
+static volatile uint64_t echo_start_us = 0;
 static uint64_t start_time_us = 0;
-static uint64_t echo_timeout_alarm = 0;
-static uint64_t periodic_alarm = 0;
-static bool reading_in_progress = false;
+static volatile uint64_t echo_timeout_alarm = 0;
+static volatile uint64_t periodic_alarm = 0;
+static volatile bool reading_in_progress = false;
+
+static reading_t last_reading = {0, 0.0f, false};
+static volatile bool new_reading_available = false;
 
 static float calculate_distance(uint32_t pulse_us) {
     return pulse_us / 58.0f;
@@ -42,7 +51,11 @@ static void gpio_callback(uint gpio, uint32_t events) {
         }
         
         uint32_t elapsed_s = (current_time - start_time_us) / 1000000;
-        printf("%us - %.1f cm\n", elapsed_s, distance_cm);
+        
+        last_reading.elapsed_s = elapsed_s;
+        last_reading.distance_cm = distance_cm;
+        last_reading.is_error = false;
+        new_reading_available = true;
         
         reading_in_progress = false;
     }
@@ -54,7 +67,12 @@ static int64_t timeout_alarm_callback(alarm_id_t id, void *user_data) {
     if (system_state == STATE_RUNNING && reading_in_progress) {
         uint64_t current_time = time_us_64();
         uint32_t elapsed_s = (current_time - start_time_us) / 1000000;
-        printf("%us - Falha\n", elapsed_s);
+        
+        last_reading.elapsed_s = elapsed_s;
+        last_reading.distance_cm = 0.0f;
+        last_reading.is_error = true;
+        new_reading_available = true;
+        
         reading_in_progress = false;
     }
     
@@ -192,6 +210,17 @@ static void read_serial_input(void) {
     }
 }
 
+static void print_pending_readings(void) {
+    if (new_reading_available) {
+        if (last_reading.is_error) {
+            printf("%us - Falha\n", last_reading.elapsed_s);
+        } else {
+            printf("%us - %.1f cm\n", last_reading.elapsed_s, last_reading.distance_cm);
+        }
+        new_reading_available = false;
+    }
+}
+
 int main() {
     stdio_init_all();
     
@@ -203,6 +232,7 @@ int main() {
     
     while (true) {
         read_serial_input();
+        print_pending_readings();
         sleep_us(100);
     }
     
