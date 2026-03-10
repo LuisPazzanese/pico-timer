@@ -20,7 +20,7 @@ typedef struct {
 } reading_t;
 
 static volatile system_state_t system_state = STATE_STOPPED;
-static uint32_t period_ms = 3000;
+static volatile uint32_t period_ms = 3000;
 static volatile uint64_t echo_start_us = 0;
 static uint64_t start_time_us = 0;
 static volatile uint64_t echo_timeout_alarm = 0;
