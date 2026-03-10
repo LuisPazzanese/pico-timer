@@ -19,13 +19,25 @@ typedef struct {
     bool is_error;
 } reading_t;
 
-static volatile system_state_t system_state = STATE_STOPPED;
-static volatile uint32_t period_ms = 3000;
-static volatile uint64_t echo_start_us = 0;
-static uint64_t start_time_us = 0;
-static volatile uint64_t echo_timeout_alarm = 0;
-static volatile uint64_t periodic_alarm = 0;
-static volatile bool reading_in_progress = false;
+typedef struct {
+    volatile system_state_t state;
+    volatile uint32_t period_ms;
+    volatile uint64_t echo_start_us;
+    uint64_t start_time_us;
+    volatile uint64_t echo_timeout_alarm;
+    volatile uint64_t periodic_alarm;
+    volatile bool reading_in_progress;
+} sensor_context_t;
+
+static volatile sensor_context_t sensor_ctx = {
+    .state = STATE_STOPPED,
+    .period_ms = 3000,
+    .echo_start_us = 0,
+    .start_time_us = 0,
+    .echo_timeout_alarm = 0,
+    .periodic_alarm = 0,
+    .reading_in_progress = false,
+};
 
 static reading_t last_reading = {0, 0.0f, false};
 static volatile bool new_reading_available = false;
@@ -40,40 +52,40 @@ static void gpio_callback(uint gpio, uint32_t events) {
     uint64_t current_time = time_us_64();
     
     if (events & GPIO_IRQ_EDGE_RISE) {
-        echo_start_us = current_time;
+        sensor_ctx.echo_start_us = current_time;
     } else if (events & GPIO_IRQ_EDGE_FALL) {
-        uint32_t pulse_duration = current_time - echo_start_us;
+        uint32_t pulse_duration = current_time - sensor_ctx.echo_start_us;
         float distance_cm = calculate_distance(pulse_duration);
         
-        if (echo_timeout_alarm > 0) {
-            cancel_alarm(echo_timeout_alarm);
-            echo_timeout_alarm = 0;
+        if (sensor_ctx.echo_timeout_alarm > 0) {
+            cancel_alarm(sensor_ctx.echo_timeout_alarm);
+            sensor_ctx.echo_timeout_alarm = 0;
         }
         
-        uint32_t elapsed_s = (current_time - start_time_us) / 1000000;
+        uint32_t elapsed_s = (current_time - sensor_ctx.start_time_us) / 1000000;
         
         last_reading.elapsed_s = elapsed_s;
         last_reading.distance_cm = distance_cm;
         last_reading.is_error = false;
         new_reading_available = true;
         
-        reading_in_progress = false;
+        sensor_ctx.reading_in_progress = false;
     }
 }
 
 static int64_t timeout_alarm_callback(alarm_id_t id, void *user_data) {
-    echo_timeout_alarm = 0;
+    sensor_ctx.echo_timeout_alarm = 0;
     
-    if (system_state == STATE_RUNNING && reading_in_progress) {
+    if (sensor_ctx.state == STATE_RUNNING && sensor_ctx.reading_in_progress) {
         uint64_t current_time = time_us_64();
-        uint32_t elapsed_s = (current_time - start_time_us) / 1000000;
+        uint32_t elapsed_s = (current_time - sensor_ctx.start_time_us) / 1000000;
         
         last_reading.elapsed_s = elapsed_s;
         last_reading.distance_cm = 0.0f;
         last_reading.is_error = true;
         new_reading_available = true;
         
-        reading_in_progress = false;
+        sensor_ctx.reading_in_progress = false;
     }
     
     return 0;
@@ -88,19 +100,19 @@ static void send_trigger_pulse(void) {
 }
 
 static void trigger_reading(void) {
-    if (reading_in_progress) {
+    if (sensor_ctx.reading_in_progress) {
         return;
     }
     
-    reading_in_progress = true;
-    echo_timeout_alarm = add_alarm_in_ms(30, timeout_alarm_callback, NULL, false);
+    sensor_ctx.reading_in_progress = true;
+    sensor_ctx.echo_timeout_alarm = add_alarm_in_ms(30, timeout_alarm_callback, NULL, false);
     send_trigger_pulse();
 }
 
 static int64_t periodic_read_alarm_callback(alarm_id_t id, void *user_data) {
-    if (system_state == STATE_RUNNING) {
+    if (sensor_ctx.state == STATE_RUNNING) {
         trigger_reading();
-        periodic_alarm = add_alarm_in_ms(period_ms, periodic_read_alarm_callback, NULL, false);
+        sensor_ctx.periodic_alarm = add_alarm_in_ms(sensor_ctx.period_ms, periodic_read_alarm_callback, NULL, false);
     }
     return 0;
 }
@@ -117,35 +129,35 @@ static void init_sensor_gpio(void) {
 }
 
 static void start_readings(void) {
-    if (system_state == STATE_RUNNING) {
+    if (sensor_ctx.state == STATE_RUNNING) {
         printf("Already running\n");
         return;
     }
     
-    system_state = STATE_RUNNING;
-    start_time_us = time_us_64();
-    printf("Leitura iniciada. Periodo: %u ms\n", period_ms);
+    sensor_ctx.state = STATE_RUNNING;
+    sensor_ctx.start_time_us = time_us_64();
+    printf("Leitura iniciada. Periodo: %u ms\n", sensor_ctx.period_ms);
     
-    periodic_alarm = add_alarm_in_ms(0, periodic_read_alarm_callback, NULL, false);
+    sensor_ctx.periodic_alarm = add_alarm_in_ms(0, periodic_read_alarm_callback, NULL, false);
 }
 
 static void stop_readings(void) {
-    if (system_state == STATE_STOPPED) {
+    if (sensor_ctx.state == STATE_STOPPED) {
         printf("Already stopped\n");
         return;
     }
     
-    system_state = STATE_STOPPED;
-    reading_in_progress = false;
+    sensor_ctx.state = STATE_STOPPED;
+    sensor_ctx.reading_in_progress = false;
     
-    if (echo_timeout_alarm > 0) {
-        cancel_alarm(echo_timeout_alarm);
-        echo_timeout_alarm = 0;
+    if (sensor_ctx.echo_timeout_alarm > 0) {
+        cancel_alarm(sensor_ctx.echo_timeout_alarm);
+        sensor_ctx.echo_timeout_alarm = 0;
     }
     
-    if (periodic_alarm > 0) {
-        cancel_alarm(periodic_alarm);
-        periodic_alarm = 0;
+    if (sensor_ctx.periodic_alarm > 0) {
+        cancel_alarm(sensor_ctx.periodic_alarm);
+        sensor_ctx.periodic_alarm = 0;
     }
     
     printf("Leitura parada\n");
@@ -157,7 +169,7 @@ static void set_period(uint32_t period_s) {
         return;
     }
     
-    period_ms = period_s * 1000;
+    sensor_ctx.period_ms = period_s * 1000;
     printf("Periodo definido para %u segundos\n", period_s);
 }
 
