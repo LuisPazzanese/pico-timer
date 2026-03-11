@@ -13,8 +13,10 @@ volatile uint64_t ECHO_RISE, ECHO_FALL = 0;
 volatile alarm_id_t alarm_id = 0;
 volatile bool reading_in_progress = false;
 volatile uint32_t elapsed_time_s = 0;
+// @suppress("Global variable", "used in IRQ context: periodic_alarm_callback")
 volatile uint32_t reading_period_ms = 3000;
 volatile alarm_id_t periodic_alarm_id, timer_alarm_id = 0;
+// @suppress("Global variable", "used in IRQ context: periodic_alarm_callback")
 volatile bool system_active = false;
 volatile bool should_read = false;
 volatile int last_distance = 0;
