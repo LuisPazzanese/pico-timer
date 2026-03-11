@@ -16,9 +16,9 @@ volatile uint32_t elapsed_time_s = 0;
 volatile uint32_t reading_period_ms = 3000;
 volatile alarm_id_t periodic_alarm_id, timer_alarm_id = 0;
 volatile bool system_active = false;
-
-char cmd_buffer[BUFFER_SIZE];
-int cmd_index = 0;
+volatile bool should_read = false;
+volatile int last_distance = 0;
+volatile bool last_read_failed = false;
 
 void send_trigger_pulse();
 
@@ -29,15 +29,15 @@ int64_t timer_callback(alarm_id_t id, void *user_data) {
 }
 
 int64_t alarm_callback(alarm_id_t id, void *user_data) {
-    printf("%us - Falha\n", elapsed_time_s);
     reading_in_progress = false;
+    last_read_failed = true;
     alarm_id = 0;
     return 0;
 }
 
 int64_t periodic_alarm_callback(alarm_id_t id, void *user_data) {
     if (system_active) {
-        send_trigger_pulse();
+        should_read = true;
     }
     periodic_alarm_id = add_alarm_in_ms(reading_period_ms, periodic_alarm_callback, NULL, false);
     return 0;
@@ -65,18 +65,21 @@ void gpio_callback(uint gpio, uint32_t events) {
             return;
         }
         
-        int distance = pulse * 0.0343 / 2;
+        last_distance = pulse * 0.0343 / 2;
         
         if (alarm_id > 0) {
             cancel_alarm(alarm_id);
             alarm_id = 0;
         }
         
-        printf("%us - %d cm\n", elapsed_time_s, distance);
+        last_read_failed = false;
     }
 }
 
 void process_serial_commands() {
+    static char cmd_buffer[BUFFER_SIZE];
+    static int cmd_index = 0;
+    
     int ch = getchar_timeout_us(0);
     
     if (ch == PICO_ERROR_TIMEOUT) {
@@ -92,8 +95,7 @@ void process_serial_commands() {
                 if (!system_active) {
                     system_active = true;
                     printf(">> Sistema iniciado. Primeira leitura em 3s...\n");
-                    // Trigger first reading immediately
-                    send_trigger_pulse();
+                    should_read = true;
                 } else {
                     printf(">> Sistema já está ativo\n");
                 }
@@ -146,8 +148,27 @@ int main() {
     printf("Digite 'start' para iniciar ou 'stop' para parar\n");
     printf("Use 'period <segundos>' para configurar o período\n");
     
+    bool last_displayed = false;
+    
     while (true) {
         process_serial_commands();
+        
+        if (should_read) {
+            should_read = false;
+            last_displayed = false;
+            send_trigger_pulse();
+        }
+        
+        if (last_read_failed && !last_displayed) {
+            last_displayed = true;
+            printf("%us - Falha\n", elapsed_time_s);
+        }
+        
+        if (!last_read_failed && !last_displayed && !reading_in_progress) {
+            last_displayed = true;
+            printf("%us - %d cm\n", elapsed_time_s, last_distance);
+        }
+        
         sleep_ms(10);
     }
 }
