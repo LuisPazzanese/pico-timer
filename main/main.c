@@ -1,97 +1,51 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
 
-#define TRIGGER_PIN 17
-#define ECHO_PIN 16
+#define TRIGGER_PIN 14
+#define ECHO_PIN 15
+#define BUFFER_SIZE 32
 
-typedef enum {
-    STATE_STOPPED = 0,
-    STATE_RUNNING = 1,
-} system_state_t;
+volatile uint64_t ECHO_RISE, ECHO_FALL = 0;
+volatile alarm_id_t alarm_id = 0;
+volatile bool reading_in_progress = false;
+volatile uint32_t elapsed_time_s = 0;
+volatile uint32_t reading_period_ms = 3000;
+volatile alarm_id_t periodic_alarm_id, timer_alarm_id = 0;
+volatile bool system_active = false;
 
-typedef struct {
-    uint32_t elapsed_s;
-    float distance_cm;
-    bool is_error;
-} reading_t;
+char cmd_buffer[BUFFER_SIZE];
+int cmd_index = 0;
 
-typedef struct {
-    volatile system_state_t state;
-    volatile uint32_t period_ms;
-    volatile uint64_t echo_start_us;
-    uint64_t start_time_us;
-    volatile uint64_t echo_timeout_alarm;
-    volatile uint64_t periodic_alarm;
-    volatile bool reading_in_progress;
-} sensor_context_t;
+void send_trigger_pulse();
 
-static volatile sensor_context_t sensor_ctx = {
-    .state = STATE_STOPPED,
-    .period_ms = 3000,
-    .echo_start_us = 0,
-    .start_time_us = 0,
-    .echo_timeout_alarm = 0,
-    .periodic_alarm = 0,
-    .reading_in_progress = false,
-};
-
-static reading_t last_reading = {0, 0.0f, false};
-static volatile bool new_reading_available = false;
-
-static float calculate_distance(uint32_t pulse_us) {
-    return pulse_us / 58.0f;
-}
-
-static void gpio_callback(uint gpio, uint32_t events) {
-    if (gpio != ECHO_PIN) return;
-    
-    uint64_t current_time = time_us_64();
-    
-    if (events & GPIO_IRQ_EDGE_RISE) {
-        sensor_ctx.echo_start_us = current_time;
-    } else if (events & GPIO_IRQ_EDGE_FALL) {
-        uint32_t pulse_duration = current_time - sensor_ctx.echo_start_us;
-        float distance_cm = calculate_distance(pulse_duration);
-        
-        if (sensor_ctx.echo_timeout_alarm > 0) {
-            cancel_alarm(sensor_ctx.echo_timeout_alarm);
-            sensor_ctx.echo_timeout_alarm = 0;
-        }
-        
-        uint32_t elapsed_s = (current_time - sensor_ctx.start_time_us) / 1000000;
-        
-        last_reading.elapsed_s = elapsed_s;
-        last_reading.distance_cm = distance_cm;
-        last_reading.is_error = false;
-        new_reading_available = true;
-        
-        sensor_ctx.reading_in_progress = false;
-    }
-}
-
-static int64_t timeout_alarm_callback(alarm_id_t id, void *user_data) {
-    sensor_ctx.echo_timeout_alarm = 0;
-    
-    if (sensor_ctx.state == STATE_RUNNING && sensor_ctx.reading_in_progress) {
-        uint64_t current_time = time_us_64();
-        uint32_t elapsed_s = (current_time - sensor_ctx.start_time_us) / 1000000;
-        
-        last_reading.elapsed_s = elapsed_s;
-        last_reading.distance_cm = 0.0f;
-        last_reading.is_error = true;
-        new_reading_available = true;
-        
-        sensor_ctx.reading_in_progress = false;
-    }
-    
+int64_t timer_callback(alarm_id_t id, void *user_data) {
+    elapsed_time_s++;
+    timer_alarm_id = add_alarm_in_ms(1000, timer_callback, NULL, false);
     return 0;
 }
 
-static void send_trigger_pulse(void) {
+int64_t alarm_callback(alarm_id_t id, void *user_data) {
+    printf("%us - Falha\n", elapsed_time_s);
+    reading_in_progress = false;
+    alarm_id = 0;
+    return 0;
+}
+
+int64_t periodic_alarm_callback(alarm_id_t id, void *user_data) {
+    if (system_active) {
+        send_trigger_pulse();
+    }
+    periodic_alarm_id = add_alarm_in_ms(reading_period_ms, periodic_alarm_callback, NULL, false);
+    return 0;
+}
+
+void send_trigger_pulse(){
+    reading_in_progress = true;
+    alarm_id = add_alarm_in_ms(50, alarm_callback, NULL, false);
     gpio_put(TRIGGER_PIN, 0);
     sleep_us(2);
     gpio_put(TRIGGER_PIN, 1);
@@ -99,154 +53,101 @@ static void send_trigger_pulse(void) {
     gpio_put(TRIGGER_PIN, 0);
 }
 
-static void trigger_reading(void) {
-    if (sensor_ctx.reading_in_progress) {
-        return;
+void gpio_callback(uint gpio, uint32_t events) {
+    if (events & GPIO_IRQ_EDGE_RISE) {
+        ECHO_RISE = time_us_64();
     }
-    
-    sensor_ctx.reading_in_progress = true;
-    sensor_ctx.echo_timeout_alarm = add_alarm_in_ms(30, timeout_alarm_callback, NULL, false);
-    send_trigger_pulse();
-}
-
-static int64_t periodic_read_alarm_callback(alarm_id_t id, void *user_data) {
-    if (sensor_ctx.state == STATE_RUNNING) {
-        trigger_reading();
-        sensor_ctx.periodic_alarm = add_alarm_in_ms(sensor_ctx.period_ms, periodic_read_alarm_callback, NULL, false);
-    }
-    return 0;
-}
-
-static void init_sensor_gpio(void) {
-    gpio_init(TRIGGER_PIN);
-    gpio_set_dir(TRIGGER_PIN, GPIO_OUT);
-    gpio_put(TRIGGER_PIN, 0);
-    
-    gpio_init(ECHO_PIN);
-    gpio_set_dir(ECHO_PIN, GPIO_IN);
-    
-    gpio_set_irq_enabled_with_callback(ECHO_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
-}
-
-static void start_readings(void) {
-    if (sensor_ctx.state == STATE_RUNNING) {
-        printf("Already running\n");
-        return;
-    }
-    
-    sensor_ctx.state = STATE_RUNNING;
-    sensor_ctx.start_time_us = time_us_64();
-    printf("Leitura iniciada. Periodo: %u ms\n", sensor_ctx.period_ms);
-    
-    sensor_ctx.periodic_alarm = add_alarm_in_ms(0, periodic_read_alarm_callback, NULL, false);
-}
-
-static void stop_readings(void) {
-    if (sensor_ctx.state == STATE_STOPPED) {
-        printf("Already stopped\n");
-        return;
-    }
-    
-    sensor_ctx.state = STATE_STOPPED;
-    sensor_ctx.reading_in_progress = false;
-    
-    if (sensor_ctx.echo_timeout_alarm > 0) {
-        cancel_alarm(sensor_ctx.echo_timeout_alarm);
-        sensor_ctx.echo_timeout_alarm = 0;
-    }
-    
-    if (sensor_ctx.periodic_alarm > 0) {
-        cancel_alarm(sensor_ctx.periodic_alarm);
-        sensor_ctx.periodic_alarm = 0;
-    }
-    
-    printf("Leitura parada\n");
-}
-
-static void set_period(uint32_t period_s) {
-    if (period_s < 1 || period_s > 3600) {
-        printf("Periodo invalido. Use entre 1 e 3600 segundos\n");
-        return;
-    }
-    
-    sensor_ctx.period_ms = period_s * 1000;
-    printf("Periodo definido para %u segundos\n", period_s);
-}
-
-static void process_command(char *cmd) {
-    if (cmd == NULL || strlen(cmd) == 0) {
-        return;
-    }
-    
-    if (strncmp(cmd, "start", 5) == 0) {
-        start_readings();
-    } else if (strncmp(cmd, "stop", 4) == 0) {
-        stop_readings();
-    } else if (strncmp(cmd, "periodo", 7) == 0) {
-        char *period_str = cmd + 7;
-        while (*period_str && (*period_str == ' ' || *period_str == ':')) {
-            period_str++;
+    if (events & GPIO_IRQ_EDGE_FALL) {
+        ECHO_FALL = time_us_64();
+        uint64_t pulse = ECHO_FALL - ECHO_RISE;
+        
+        if (pulse > 30000) {
+            return;
         }
-        uint32_t period_s = atoi(period_str);
-        set_period(period_s);
-    } else if (strncmp(cmd, "help", 4) == 0 || strncmp(cmd, "?", 1) == 0) {
-        printf("Comandos disponiveis:\n");
-        printf("  start             - Inicia a leitura\n");
-        printf("  stop              - Para a leitura\n");
-        printf("  periodo <seg>     - Define periodo em segundos\n");
-        printf("  help              - Mostra este texto\n");
-    } else {
-        printf("Comando desconhecido. Digite 'help' para ver opcoes\n");
+        
+        int distance = pulse * 0.0343 / 2;
+        
+        if (alarm_id > 0) {
+            cancel_alarm(alarm_id);
+            alarm_id = 0;
+        }
+        
+        printf("%us - %d cm\n", elapsed_time_s, distance);
     }
 }
 
-static void read_serial_input(void) {
-    static char cmd_buffer[64];
-    static int cmd_index = 0;
+void process_serial_commands() {
+    int ch = getchar_timeout_us(0);
     
-    int c = getchar_timeout_us(100);
+    if (ch == PICO_ERROR_TIMEOUT) {
+        return;
+    }
     
-    if (c != PICO_ERROR_TIMEOUT && c != '\n' && c != '\r') {
-        if (cmd_index < (int)sizeof(cmd_buffer) - 1) {
-            cmd_buffer[cmd_index++] = (char)c;
-            printf("%c", c);
-        }
-    } else if (c == '\n' || c == '\r') {
+    if (ch == '\r' || ch == '\n') {
+        printf("\n");
         if (cmd_index > 0) {
             cmd_buffer[cmd_index] = '\0';
-            printf("\n");
-            process_command(cmd_buffer);
+            
+            if (strcmp(cmd_buffer, "start") == 0) {
+                if (!system_active) {
+                    system_active = true;
+                    printf(">> Sistema iniciado. Primeira leitura em 3s...\n");
+                    // Trigger first reading immediately
+                    send_trigger_pulse();
+                } else {
+                    printf(">> Sistema já está ativo\n");
+                }
+            } else if (strcmp(cmd_buffer, "stop") == 0) {
+                if (system_active) {
+                    system_active = false;
+                    printf(">> Sistema parado\n");
+                } else {
+                    printf(">> Sistema já está parado\n");
+                }
+            } else if (strncmp(cmd_buffer, "period ", 7) == 0) {
+                uint32_t new_period = atoi(&cmd_buffer[7]);
+                if (new_period > 0) {
+                    reading_period_ms = new_period * 1000;
+                    printf(">> Período configurado para %u segundos\n", new_period);
+                } else {
+                    printf(">> Período inválido (use: period <segundos>)\n");
+                }
+            } else {
+                printf(">> Comando desconhecido: '%s'\n", cmd_buffer);
+                printf(">> Comandos: start | stop | period <seg>\n");
+            }
+            
             cmd_index = 0;
         }
-        printf("> ");
+        return;
+    } 
+    
+    if (ch >= 32 && ch <= 126 && cmd_index < BUFFER_SIZE - 1) {
+        cmd_buffer[cmd_index++] = (char)ch;
+        printf("%c", ch);
     }
 }
 
-static void print_pending_readings(void) {
-    if (new_reading_available) {
-        if (last_reading.is_error) {
-            printf("%us - Falha\n", last_reading.elapsed_s);
-        } else {
-            printf("%us - %.1f cm\n", last_reading.elapsed_s, last_reading.distance_cm);
-        }
-        new_reading_available = false;
-    }
-}
 
 int main() {
     stdio_init_all();
+
+    gpio_init(TRIGGER_PIN);
+    gpio_set_dir(TRIGGER_PIN, GPIO_OUT);
+    gpio_init(ECHO_PIN);
+    gpio_set_dir(ECHO_PIN, GPIO_IN);
+    gpio_disable_pulls(ECHO_PIN);
+    gpio_set_irq_enabled_with_callback(ECHO_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, gpio_callback);
     
-    init_sensor_gpio();
+    periodic_alarm_id = add_alarm_in_ms(reading_period_ms, periodic_alarm_callback, NULL, false);
+    timer_alarm_id = add_alarm_in_ms(1000, timer_callback, NULL, false);
     
-    printf("\n=== HC-SR04 Sensor via Timer ===\n");
-    printf("Digite 'help' para ver comandos disponiveis\n");
-    printf("> ");
+    printf("Sistema de leitura de distância iniciado\n");
+    printf("Digite 'start' para iniciar ou 'stop' para parar\n");
+    printf("Use 'period <segundos>' para configurar o período\n");
     
     while (true) {
-        read_serial_input();
-        print_pending_readings();
-        sleep_us(100);
+        process_serial_commands();
+        sleep_ms(10);
     }
-    
-    return 0;
 }
