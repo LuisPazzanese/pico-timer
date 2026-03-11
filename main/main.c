@@ -9,18 +9,32 @@
 #define ECHO_PIN 15
 #define BUFFER_SIZE 32
 
-volatile uint64_t ECHO_RISE, ECHO_FALL = 0;
-volatile alarm_id_t alarm_id = 0;
-volatile bool reading_in_progress = false;
-volatile uint32_t elapsed_time_s = 0;
-// @suppress("Global variable", "used in IRQ context: periodic_alarm_callback")
-volatile uint32_t reading_period_ms = 3000;
-volatile alarm_id_t periodic_alarm_id, timer_alarm_id = 0;
-// @suppress("Global variable", "used in IRQ context: periodic_alarm_callback")
-volatile bool system_active = false;
-volatile bool should_read = false;
-volatile int last_distance = 0;
-volatile bool last_read_failed = false;
+/// System state for IRQ communication
+struct {
+    volatile uint64_t echo_rise, echo_fall;
+    volatile alarm_id_t alarm_id;
+    volatile bool reading_in_progress;
+    volatile uint32_t elapsed_time_s;
+    volatile uint32_t reading_period_ms; ///< read in periodic_alarm_callback (IRQ)
+    volatile alarm_id_t periodic_alarm_id, timer_alarm_id;
+    volatile bool system_active;          ///< read in periodic_alarm_callback (IRQ)
+    volatile bool should_read;
+    volatile int last_distance;
+    volatile bool last_read_failed;
+} sys = {.reading_period_ms = 3000};
+
+#define ECHO_RISE sys.echo_rise
+#define ECHO_FALL sys.echo_fall
+#define alarm_id sys.alarm_id
+#define reading_in_progress sys.reading_in_progress
+#define elapsed_time_s sys.elapsed_time_s
+#define reading_period_ms sys.reading_period_ms
+#define periodic_alarm_id sys.periodic_alarm_id
+#define timer_alarm_id sys.timer_alarm_id
+#define system_active sys.system_active
+#define should_read sys.should_read
+#define last_distance sys.last_distance
+#define last_read_failed sys.last_read_failed
 
 void send_trigger_pulse();
 
